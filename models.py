@@ -1,4 +1,6 @@
-from sqlmodel import SQLModel, Field
+from sqlmodel import SQLModel, Field, create_engine
+
+engine = create_engine("sqlite:///inventory.db")
 
 
 class Inventory(SQLModel, table=True):
