@@ -1,0 +1,880 @@
+========================================================================
+WAREHOUSE INVENTORY APP — AUTHENTICATION FEATURE NOTES
+========================================================================
+
+These notes contain all the code added during the auth session.
+The app was reverted to the "classroom-baseline" tag after this was saved.
+
+Prerequisite:
+  pip install bcrypt
+
+========================================================================
+FILE: models.py
+========================================================================
+
+from sqlmodel import SQLModel, Field, create_engine
+
+engine = create_engine("sqlite:///inventory.db")
+
+
+class Inventory(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    product_name: str
+    category: str
+    quantity: int
+    price: float
+    supplier: str | None = None
+
+
+class User(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    username: str = Field(unique=True)
+    password_hash: str
+
+
+========================================================================
+FILE: main.py
+========================================================================
+
+from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, Cookie, Depends, HTTPException
+from fastapi.responses import JSONResponse
+from sqlmodel import Session, select, SQLModel
+from pydantic import BaseModel
+from models import engine, Inventory, User
+import bcrypt
+
+app = FastAPI()
+
+SQLModel.metadata.create_all(engine)
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post('/register')
+def register(req: RegisterRequest):
+    password_hash = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+    user = User(username=req.username, password_hash=password_hash)
+    with Session(engine) as session:
+        session.add(user)
+        session.commit()
+        return {"message": "User created successfully"}
+
+
+@app.post('/login')
+def login(req: RegisterRequest):
+    with Session(engine) as session:
+        statement = select(User).where(User.username == req.username)
+        user = session.exec(statement).first()
+        if not user:
+            return JSONResponse(status_code=401, content={"message": "Invalid username or password"})
+        if not bcrypt.checkpw(req.password.encode(), user.password_hash.encode()):
+            return JSONResponse(status_code=401, content={"message": "Invalid username or password"})
+        response = JSONResponse(content={"message": "Login successful"})
+        response.set_cookie(key="session_user", value=user.username)
+        return response
+
+
+@app.post('/logout')
+def logout():
+    response = JSONResponse(content={"message": "Logged out"})
+    response.delete_cookie(key="session_user")
+    return response
+
+
+def require_login(session_user: str | None = Cookie(default=None)):
+    if not session_user:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    return session_user
+
+
+@app.get("/inventory")
+def get_inventory(user: str = Depends(require_login)):
+    with Session(engine) as session:
+        statement = select(Inventory)
+        records = session.exec(statement).all()
+        return records
+
+@app.put('/inventory/{id}')
+def update_item(id:int, updated:Inventory, user: str = Depends(require_login)):
+    with Session(engine) as session:
+        statement = select(Inventory).where(Inventory.id == id)
+        record = session.exec(statement).one()
+        record.product_name = updated.product_name
+        record.category = updated.category
+        record.quantity = updated.quantity
+        record.price = updated.price
+        record.supplier = updated.supplier
+        session.commit()
+        session.refresh(record)
+        return record
+
+@app.post('/inventory')
+def create_item(item:Inventory, user: str = Depends(require_login)):
+    with Session(engine) as session:
+        session.add(item)
+        session.commit()
+        session.refresh(item)
+        return item
+
+@app.delete('/inventory/{id}')
+def delete_item(id:int, user: str = Depends(require_login)):
+    with Session(engine) as session:
+        statement = select(Inventory).where(Inventory.id == id)
+        record = session.exec(statement).one()
+        session.delete(record)
+        session.commit()
+
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
+
+
+========================================================================
+FILE: static/index.html
+========================================================================
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Warehouse Inventory</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <!-- Login screen -->
+    <div id="login-screen" class="container">
+        <header>
+            <h1>Warehouse Inventory</h1>
+        </header>
+        <div class="login-box">
+            <h2 id="auth-title">Sign In</h2>
+            <form id="login-form">
+                <div class="form-group">
+                    <label for="login-username">Username</label>
+                    <input type="text" id="login-username" required>
+                </div>
+                <div class="form-group">
+                    <label for="login-password">Password</label>
+                    <input type="password" id="login-password" required>
+                </div>
+                <p id="login-error" class="login-error hidden"></p>
+                <div class="form-actions">
+                    <button type="submit" id="auth-submit" class="btn btn-primary">Sign In</button>
+                </div>
+            </form>
+            <p class="auth-toggle">
+                <span id="toggle-register">Don't have an account? <a href="#">Register</a></span>
+                <span id="toggle-login" class="hidden">Already have an account? <a href="#">Sign In</a></span>
+            </p>
+        </div>
+    </div>
+
+    <!-- Main app (hidden until logged in) -->
+    <div id="app-screen" class="container hidden">
+        <header>
+            <h1>Warehouse Inventory</h1>
+            <button id="logout-btn" class="btn btn-secondary">Logout</button>
+        </header>
+        <div class="toolbar">
+            <button id="add-btn" class="btn btn-primary">+ New Record</button>
+            <span id="record-count" class="record-count"></span>
+        </div>
+
+        <!-- Modal for Add/Edit -->
+        <div id="modal-overlay" class="modal-overlay hidden">
+            <div class="modal">
+                <div class="modal-header">
+                    <h2 id="modal-title">New Record</h2>
+                    <button id="modal-close" class="modal-close">&times;</button>
+                </div>
+                <form id="record-form">
+                    <input type="hidden" id="form-id">
+                    <div class="form-group">
+                        <label for="form-product-name">Product Name</label>
+                        <input type="text" id="form-product-name" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="form-category">Category</label>
+                        <input type="text" id="form-category" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="form-quantity">Quantity</label>
+                        <input type="number" id="form-quantity" min="0" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="form-price">Price</label>
+                        <input type="number" id="form-price" min="0" step="0.01" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="form-supplier">Supplier</label>
+                        <input type="text" id="form-supplier">
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" id="modal-cancel" class="btn btn-secondary">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Save</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Delete confirmation -->
+        <div id="delete-overlay" class="modal-overlay hidden">
+            <div class="modal modal-sm">
+                <div class="modal-header">
+                    <h2>Confirm Delete</h2>
+                    <button id="delete-close" class="modal-close">&times;</button>
+                </div>
+                <p id="delete-message" class="delete-message">Are you sure you want to delete this record?</p>
+                <div class="form-actions">
+                    <button id="delete-cancel" class="btn btn-secondary">Cancel</button>
+                    <button id="delete-confirm" class="btn btn-danger">Delete</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="table-wrapper">
+            <table id="inventory-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Product Name</th>
+                        <th>Category</th>
+                        <th>Quantity</th>
+                        <th>Price</th>
+                        <th>Supplier</th>
+                        <th class="actions-col">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="inventory-body">
+                </tbody>
+            </table>
+            <div id="empty-state" class="empty-state hidden">No inventory records found.</div>
+            <div id="loading" class="loading">Loading inventory...</div>
+            <div id="error-state" class="error-state hidden"></div>
+        </div>
+    </div> <!-- end app-screen -->
+    <script src="/script.js"></script>
+</body>
+</html>
+
+
+========================================================================
+FILE: static/script.js
+========================================================================
+
+// --- Login / Logout ---
+
+const loginScreen = document.getElementById("login-screen");
+const appScreen = document.getElementById("app-screen");
+const loginForm = document.getElementById("login-form");
+const loginError = document.getElementById("login-error");
+const authTitle = document.getElementById("auth-title");
+const authSubmit = document.getElementById("auth-submit");
+const toggleRegister = document.getElementById("toggle-register");
+const toggleLogin = document.getElementById("toggle-login");
+
+let isRegisterMode = false;
+
+toggleRegister.addEventListener("click", function (e) {
+    e.preventDefault();
+    isRegisterMode = true;
+    authTitle.textContent = "Register";
+    authSubmit.textContent = "Register";
+    toggleRegister.classList.add("hidden");
+    toggleLogin.classList.remove("hidden");
+    loginError.classList.add("hidden");
+    loginForm.reset();
+});
+
+toggleLogin.addEventListener("click", function (e) {
+    e.preventDefault();
+    isRegisterMode = false;
+    authTitle.textContent = "Sign In";
+    authSubmit.textContent = "Sign In";
+    toggleLogin.classList.add("hidden");
+    toggleRegister.classList.remove("hidden");
+    loginError.classList.add("hidden");
+    loginForm.reset();
+});
+
+loginForm.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    loginError.classList.add("hidden");
+    const username = document.getElementById("login-username").value.trim();
+    const password = document.getElementById("login-password").value;
+    const url = isRegisterMode ? "/register" : "/login";
+
+    try {
+        const res = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ username, password }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            loginError.textContent = data.message || data.detail || "Request failed";
+            loginError.classList.remove("hidden");
+            return;
+        }
+        if (isRegisterMode) {
+            // Registration succeeded — switch to sign in mode
+            isRegisterMode = false;
+            authTitle.textContent = "Sign In";
+            authSubmit.textContent = "Sign In";
+            toggleLogin.classList.add("hidden");
+            toggleRegister.classList.remove("hidden");
+            loginError.textContent = "Account created! Please sign in.";
+            loginError.classList.remove("hidden");
+            loginError.style.color = "#27ae60";
+            loginForm.reset();
+            return;
+        }
+        showApp();
+    } catch (err) {
+        loginError.textContent = "Connection error: " + err.message;
+        loginError.classList.remove("hidden");
+    }
+});
+
+document.getElementById("logout-btn").addEventListener("click", async function () {
+    await fetch("/logout", { method: "POST" });
+    showLogin();
+});
+
+function showApp() {
+    loginScreen.classList.add("hidden");
+    appScreen.classList.remove("hidden");
+    loadInventory();
+}
+
+function showLogin() {
+    appScreen.classList.add("hidden");
+    loginScreen.classList.remove("hidden");
+    loginError.classList.add("hidden");
+    loginError.style.color = "";
+    loginForm.reset();
+}
+
+// --- Inventory ---
+
+const tbody = document.getElementById("inventory-body");
+const loading = document.getElementById("loading");
+const emptyState = document.getElementById("empty-state");
+const errorState = document.getElementById("error-state");
+const recordCount = document.getElementById("record-count");
+const table = document.getElementById("inventory-table");
+
+// Modal elements
+const modalOverlay = document.getElementById("modal-overlay");
+const modalTitle = document.getElementById("modal-title");
+const recordForm = document.getElementById("record-form");
+const formId = document.getElementById("form-id");
+const formProductName = document.getElementById("form-product-name");
+const formCategory = document.getElementById("form-category");
+const formQuantity = document.getElementById("form-quantity");
+const formPrice = document.getElementById("form-price");
+const formSupplier = document.getElementById("form-supplier");
+
+// Delete modal elements
+const deleteOverlay = document.getElementById("delete-overlay");
+const deleteMessage = document.getElementById("delete-message");
+const deleteConfirm = document.getElementById("delete-confirm");
+
+let deleteTargetId = null;
+
+function formatPrice(value) {
+    return "$" + Number(value).toFixed(2);
+}
+
+function renderTable(records) {
+    loading.classList.add("hidden");
+
+    if (records.length === 0) {
+        table.classList.add("hidden");
+        emptyState.classList.remove("hidden");
+        recordCount.textContent = "";
+        return;
+    }
+
+    table.classList.remove("hidden");
+    emptyState.classList.add("hidden");
+    recordCount.textContent = records.length + " record" + (records.length !== 1 ? "s" : "");
+
+    tbody.innerHTML = "";
+    for (const r of records) {
+        const tr = document.createElement("tr");
+        tr.innerHTML =
+            "<td class='numeric'>" + r.id + "</td>" +
+            "<td>" + escapeHtml(r.product_name) + "</td>" +
+            "<td>" + escapeHtml(r.category) + "</td>" +
+            "<td class='numeric'>" + r.quantity + "</td>" +
+            "<td class='numeric'>" + formatPrice(r.price) + "</td>" +
+            "<td>" + escapeHtml(r.supplier || "") + "</td>" +
+            "<td class='actions'>" +
+                "<button class='btn btn-secondary btn-sm edit-btn' data-id='" + r.id + "'>Edit</button>" +
+                "<button class='btn btn-danger btn-sm delete-btn' data-id='" + r.id + "'>Delete</button>" +
+            "</td>";
+        tbody.appendChild(tr);
+    }
+}
+
+function escapeHtml(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function showError(message) {
+    loading.classList.add("hidden");
+    table.classList.add("hidden");
+    emptyState.classList.add("hidden");
+    errorState.textContent = message;
+    errorState.classList.remove("hidden");
+}
+
+async function loadInventory() {
+    try {
+        const res = await fetch("/inventory");
+        if (res.status === 401) {
+            showLogin();
+            return;
+        }
+        if (!res.ok) throw new Error("Server returned " + res.status);
+        const data = await res.json();
+        renderTable(data);
+    } catch (err) {
+        showError("Failed to load inventory: " + err.message);
+    }
+}
+
+// --- Modal helpers ---
+
+function openModal(title, record) {
+    modalTitle.textContent = title;
+    formId.value = record ? record.id : "";
+    formProductName.value = record ? record.product_name : "";
+    formCategory.value = record ? record.category : "";
+    formQuantity.value = record ? record.quantity : "";
+    formPrice.value = record ? record.price : "";
+    formSupplier.value = record ? (record.supplier || "") : "";
+    modalOverlay.classList.remove("hidden");
+    formProductName.focus();
+}
+
+function closeModal() {
+    modalOverlay.classList.add("hidden");
+    recordForm.reset();
+}
+
+function openDeleteModal(id) {
+    deleteTargetId = id;
+    deleteMessage.textContent = "Are you sure you want to delete record #" + id + "?";
+    deleteOverlay.classList.remove("hidden");
+}
+
+function closeDeleteModal() {
+    deleteOverlay.classList.add("hidden");
+    deleteTargetId = null;
+}
+
+// --- Event listeners ---
+
+document.getElementById("add-btn").addEventListener("click", function () {
+    openModal("New Record", null);
+});
+
+document.getElementById("modal-close").addEventListener("click", closeModal);
+document.getElementById("modal-cancel").addEventListener("click", closeModal);
+
+modalOverlay.addEventListener("click", function (e) {
+    if (e.target === modalOverlay) closeModal();
+});
+
+recordForm.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    const record = {
+        product_name: formProductName.value.trim(),
+        category: formCategory.value.trim(),
+        quantity: parseInt(formQuantity.value, 10),
+        price: parseFloat(formPrice.value),
+        supplier: formSupplier.value.trim() || null,
+    };
+    const id = formId.value;
+
+    if (id) {
+        try {
+            await fetch("/inventory/" + id, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(record),
+            });
+            loadInventory();
+        } catch (err) {
+            alert("Error updating record: " + err.message);
+        }
+    } else {
+        try {
+            await fetch("/inventory", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(record),
+            });
+            loadInventory();
+        } catch (err) {
+            alert("Error creating record: " + err.message);
+        }
+    }
+    closeModal();
+});
+
+document.getElementById("delete-close").addEventListener("click", closeDeleteModal);
+document.getElementById("delete-cancel").addEventListener("click", closeDeleteModal);
+
+deleteOverlay.addEventListener("click", function (e) {
+    if (e.target === deleteOverlay) closeDeleteModal();
+});
+
+deleteConfirm.addEventListener("click", async function () {
+    if (deleteTargetId !== null) {
+        try {
+            await fetch("/inventory/" + deleteTargetId, { method: "DELETE" });
+            closeDeleteModal();
+            loadInventory();
+        } catch (err) {
+            alert("Error deleting record: " + err.message);
+            closeDeleteModal();
+        }
+        return;
+    }
+    closeDeleteModal();
+});
+
+// Delegate edit/delete clicks on table rows
+tbody.addEventListener("click", function (e) {
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    const id = parseInt(btn.dataset.id, 10);
+    const row = btn.closest("tr");
+    const cells = row.querySelectorAll("td");
+
+    if (btn.classList.contains("edit-btn")) {
+        openModal("Edit Record #" + id, {
+            id: id,
+            product_name: cells[1].textContent,
+            category: cells[2].textContent,
+            quantity: parseInt(cells[3].textContent, 10),
+            price: parseFloat(cells[4].textContent.replace("$", "")),
+            supplier: cells[5].textContent,
+        });
+    } else if (btn.classList.contains("delete-btn")) {
+        openDeleteModal(id);
+    }
+});
+
+// On page load, try to fetch inventory — if 401, show login
+loadInventory();
+
+
+========================================================================
+FILE: static/style.css
+========================================================================
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #f4f6f9;
+    color: #333;
+    line-height: 1.5;
+}
+
+.container {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 24px;
+}
+
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
+
+header h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: #1a1a2e;
+}
+
+/* Login */
+.login-box {
+    max-width: 360px;
+    margin: 60px auto;
+    background: #fff;
+    border: 1px solid #dce1e8;
+    border-radius: 8px;
+    padding: 24px;
+}
+
+.login-box h2 {
+    font-size: 1.15rem;
+    font-weight: 600;
+    color: #1a1a2e;
+    margin-bottom: 16px;
+}
+
+.login-error {
+    color: #e74c3c;
+    font-size: 0.85rem;
+    margin-top: 8px;
+}
+
+.auth-toggle {
+    text-align: center;
+    font-size: 0.85rem;
+    color: #666;
+    margin-top: 16px;
+}
+
+.auth-toggle a {
+    color: #4a6cf7;
+    text-decoration: none;
+}
+
+.auth-toggle a:hover {
+    text-decoration: underline;
+}
+
+/* Toolbar */
+.toolbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 16px;
+}
+
+.record-count {
+    font-size: 0.85rem;
+    color: #666;
+}
+
+/* Buttons */
+.btn {
+    padding: 7px 16px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.btn-primary {
+    background: #4a6cf7;
+    color: #fff;
+}
+
+.btn-primary:hover {
+    background: #3b5de7;
+}
+
+.btn-secondary {
+    background: #fff;
+    color: #333;
+    border-color: #ccc;
+}
+
+.btn-secondary:hover {
+    background: #f0f0f0;
+}
+
+.btn-danger {
+    background: #e74c3c;
+    color: #fff;
+}
+
+.btn-danger:hover {
+    background: #d63a2a;
+}
+
+.btn-sm {
+    padding: 4px 10px;
+    font-size: 0.8rem;
+}
+
+/* Table */
+.table-wrapper {
+    background: #fff;
+    border: 1px solid #dce1e8;
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+thead {
+    background: #f0f2f7;
+}
+
+th {
+    text-align: left;
+    padding: 10px 14px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #555;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    border-bottom: 2px solid #dce1e8;
+    white-space: nowrap;
+}
+
+td {
+    padding: 10px 14px;
+    font-size: 0.88rem;
+    border-bottom: 1px solid #eef0f4;
+}
+
+tbody tr:hover {
+    background: #f8f9fc;
+}
+
+tbody tr:last-child td {
+    border-bottom: none;
+}
+
+.actions-col {
+    width: 130px;
+    text-align: center;
+}
+
+td.actions {
+    text-align: center;
+    white-space: nowrap;
+}
+
+td.actions .btn {
+    margin: 0 3px;
+}
+
+td.numeric {
+    font-variant-numeric: tabular-nums;
+}
+
+/* States */
+.loading, .empty-state, .error-state {
+    padding: 40px;
+    text-align: center;
+    font-size: 0.9rem;
+    color: #888;
+}
+
+.error-state {
+    color: #c0392b;
+}
+
+.hidden {
+    display: none !important;
+}
+
+/* Modal */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.35);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+}
+
+.modal {
+    background: #fff;
+    border-radius: 8px;
+    width: 440px;
+    max-width: 95vw;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.15);
+}
+
+.modal-sm {
+    width: 360px;
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    border-bottom: 1px solid #eef0f4;
+}
+
+.modal-header h2 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: #1a1a2e;
+}
+
+.modal-close {
+    background: none;
+    border: none;
+    font-size: 1.4rem;
+    cursor: pointer;
+    color: #999;
+    line-height: 1;
+}
+
+.modal-close:hover {
+    color: #333;
+}
+
+.form-group {
+    padding: 0 20px;
+    margin-top: 14px;
+}
+
+.form-group label {
+    display: block;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #555;
+    margin-bottom: 4px;
+}
+
+.form-group input {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 0.88rem;
+    font-family: inherit;
+    transition: border-color 0.15s;
+}
+
+.form-group input:focus {
+    outline: none;
+    border-color: #4a6cf7;
+    box-shadow: 0 0 0 2px rgba(74, 108, 247, 0.15);
+}
+
+.form-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 16px 20px;
+}
+
+.delete-message {
+    padding: 16px 20px;
+    font-size: 0.9rem;
+    color: #555;
+}
